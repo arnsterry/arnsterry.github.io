@@ -5,9 +5,10 @@
 # --------------------------------------------------------------------------------------------
 #
 # Usage:
-#         ./install.sh [option]
+#         ./installer.sh [option]
 #
 #           -i              Install Eggdrop + BlackTools or A&A
+#           -r              Add backups / auto-repair / outage protection to ALL existing bots
 #           -h, --help      Display script options
 #
 # --------------------------------------------------------------------------------------------
@@ -934,25 +935,48 @@ WARPEOF_UNIT
 
     sudo tee /usr/local/bin/warpns-watchdog >/dev/null <<'WARPEOF_WD'
 #!/bin/bash
-# Run every minute by warpns-watchdog.timer: if a tunnel is dead, restart it
-# (its bot restarts too). If a restart does not help, try the next UDP port.
+# Run every minute by warpns-watchdog.timer.
+# Heals a dead WARP tunnel - but ONLY while this machine itself has internet.
+# When the whole connection is down (overdue bill, router off) every tunnel looks dead; restarting
+# them would kill all bots in the middle of saving their userfiles and shuffle UDP ports for nothing.
+st=/run/warpns-watchdog; mkdir -p "$st"
 ports=(4500 2408 500 1701)
+host_online() {
+  ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 || \
+    curl -4 -s -m 6 -o /dev/null https://1.1.1.1
+}
 alive() { ip netns exec "$1" curl -6 -s -m 8 -o /dev/null https://ipv6.icanhazip.com; }
+now=$(date +%s)
+if ! host_online; then
+  [ -e "$st/offline" ] || logger -t warpns-watchdog "no internet on the host - leaving tunnels and bots alone"
+  touch "$st/offline"; rm -f "$st"/*.fails "$st"/*.restarts; exit 0
+fi
+if [ -e "$st/offline" ]; then
+  rm -f "$st/offline"; echo "$now" > "$st/back"
+  logger -t warpns-watchdog "internet is back - waiting 5 minutes before touching any tunnel"
+fi
+if [ -e "$st/back" ] && [ $(( now - $(cat "$st/back") )) -lt 300 ]; then exit 0; fi
 for f in /etc/warpns/*.conf; do
   [ -f "$f" ] || continue
   n=$(basename "$f" .conf)
   ip netns list | grep -qw "$n" || continue
-  alive "$n" && continue
-  sleep 5; alive "$n" && continue
-  logger -t warpns-watchdog "tunnel $n is dead - restarting it"
+  if alive "$n"; then rm -f "$st/$n.fails" "$st/$n.restarts"; continue; fi
+  c=$(( $(cat "$st/$n.fails" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$st/$n.fails"
+  [ "$c" -ge 3 ] || continue                                   # 3 failed checks in a row
+  if [ -e "$st/$n.last" ] && [ $(( now - $(stat -c %Y "$st/$n.last") )) -lt 600 ]; then continue; fi  # 10 min cooldown
+  touch "$st/$n.last"; echo 0 > "$st/$n.fails"
+  r=$(( $(cat "$st/$n.restarts" 2>/dev/null || echo 0) + 1 )); echo "$r" > "$st/$n.restarts"
+  logger -t warpns-watchdog "tunnel $n is dead (internet is up) - restarting it"
   systemctl restart "wgns@$n"; sleep 12
-  alive "$n" && continue
-  cur=$(grep -oE '^Endpoint = [0-9.]+:[0-9]+' "$f" | grep -oE '[0-9]+$')
-  next=4500
-  for i in 0 1 2 3; do [ "${ports[$i]}" = "$cur" ] && next=${ports[$(( (i+1) % 4 ))]}; done
-  sed -i -E "s|^(Endpoint = [0-9.]+:)[0-9]+|\1$next|" "$f"
-  logger -t warpns-watchdog "tunnel $n still dead - switching UDP port $cur -> $next"
-  systemctl restart "wgns@$n"
+  if alive "$n"; then rm -f "$st/$n.restarts"; continue; fi
+  if [ "$r" -ge 2 ]; then                                       # only change port after 2 failed restarts
+    cur=$(grep -oE '^Endpoint = [0-9.]+:[0-9]+' "$f" | grep -oE '[0-9]+$')
+    next=4500
+    for i in 0 1 2 3; do [ "${ports[$i]}" = "$cur" ] && next=${ports[$(( (i+1) % 4 ))]}; done
+    sed -i -E "s|^(Endpoint = [0-9.]+:)[0-9]+|\1$next|" "$f"
+    logger -t warpns-watchdog "tunnel $n still dead - switching UDP port $cur -> $next"
+    systemctl restart "wgns@$n"
+  fi
 done
 exit 0
 WARPEOF_WD
@@ -1348,11 +1372,11 @@ download_eggdrop() {
             [ -f "${lf}" ] || continue
             LC_ALL=C sed \
                 -e 's/^\(0x6[0-9a-fA-F][0-9a-fA-F],\)NOTICE %s :/\1PRIVMSG %s :/' \
-                -e "s/^\(0x60a,PRIVMSG %s :\)Hi %s!  I'm %s, an eggdrop bot\./\1Hi %s!  I'm %s, an eggdrop bot./" \
-                -e "s/^\(0x60b,PRIVMSG %s :\)I'll recognize you by hostmask '%s' from now on\./\1I'll recognize you by hostmask '%s' from now on./" \
-                -e "s/^\(0x60e,\)YOU ARE THE OWNER ON THIS BOT NOW/\1*** HOORAH! *** YOU ARE THE OWNER ON THIS BOT NOW/" \
-                -e "s/^\(0x664,PRIVMSG %s :\)As master you really need to set a password: with \/MSG %s pass <your-chosen-password>\./\1As master you really need to set a password: with \/MSG %s pass <your-chosen-password>./" \
-                -e "s/^\(0x665,PRIVMSG %s :\)All major commands are used from DCC chat\. From now on, you don't need to use the -m option when starting the bot\.  Enjoy !!!/\1All major commands are used from DCC chat. From now on, you don't need to use the -m option when starting the bot.  Enjoy !!!/" \
+                -e "s/^\(0x60a,PRIVMSG %s :\)Hi %s!  I'm %s, an eggdrop bot\./\1${_c}05Hi ${_c}09%s${_c}05!  I'm ${_c}09%s${_c}05, an eggdrop bot./" \
+                -e "s/^\(0x60b,PRIVMSG %s :\)I'll recognize you by hostmask '%s' from now on\./\1${_c}05I'll recognize you by hostmask '${_c}09%s${_c}05' from now on./" \
+                -e "s/^\(0x60e,\)YOU ARE THE OWNER ON THIS BOT NOW/\1${_c}09*** HOORAH! *** ${_c}04YOU ARE THE OWNER ON THIS BOT NOW/" \
+                -e "s/^\(0x664,PRIVMSG %s :\)As master you really need to set a password: with \/MSG %s pass <your-chosen-password>\./\1${_c}05As master you really need to set a password: with ${_c}04\/MSG %s pass <your-chosen-password>${_c}05./" \
+                -e "s/^\(0x665,PRIVMSG %s :\)All major commands are used from DCC chat\. From now on, you don't need to use the -m option when starting the bot\.  Enjoy !!!/\1${_c}05All major commands are used from DCC chat. From now on, you don't need to use the -m option when starting the bot.  ${_c}09Enjoy !!!/" \
                 "${lf}" > "${lf}.new" && mv "${lf}.new" "${lf}"
         done
     fi
@@ -1672,8 +1696,8 @@ set nick        "${BOTNICK}"
 set altnick     "${ALTNICK}"
 set realname    "${REALNAME}"
 
-set chanserv(user) {${AA_CHANSERV_USER}}
-set chanserv(pass) {${AA_CHANSERV_PASS}}
+set chanserv(user) "${AA_CHANSERV_USER}"
+set chanserv(pass) "${AA_CHANSERV_PASS}"
 
 listen ${LISTEN_PORT} all
 
@@ -2317,12 +2341,14 @@ ExecStartPre=/bin/rm -f ${PID_FILE}
 ExecStart=${EGGDROP_INSTALL_DIR}/eggdrop ${BOTNICK}.conf
 ExecStop=/bin/kill -TERM \$MAINPID
 Restart=always
-RestartSec=10
+RestartSec=30
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
+    if type resilience_attach_service >/dev/null 2>&1; then resilience_attach_service "${SVC_NAME}"; fi
     sudo systemctl daemon-reload
     sudo systemctl enable "${SVC_NAME}" > /dev/null 2>&1
 
@@ -2800,14 +2826,268 @@ show_success_aa() {
 }
 
 # ---------------------------------------------------------------------------
+# Resilience toolkit: survive internet outages / unpaid bills / hard power loss
+# ---------------------------------------------------------------------------
+#   eggdrop-dbguard   before every start: recreate db/, restore damaged or missing userfiles
+#   eggdrop-dbbackup  every 30 min: keep valid copies (48 half-hourly + 14 daily) in /var/backups/eggdrop
+#   eggdrop-stagger   after a reboot: spread the bot starts out
+#   eggdrop-doctor    one command to check/repair everything  (eggdrop-doctor --start)
+#   warpns-watchdog   (rewritten) does NOTHING while the host has no internet
+# Retrofit all existing bots:  ./installer.sh -r
+# ---------------------------------------------------------------------------
+
+install_resilience_toolkit() {
+    if [ -z "${BT_ON_LINUX-}" ] || ! command -v systemctl >/dev/null 2>&1; then
+        warn "Resilience toolkit needs Linux + systemd - skipped."
+        return 0
+    fi
+    check_sudo
+    ohai "Installing the ${tty_green}resilience toolkit${tty_reset} (backups, auto-repair, outage-safe watchdog)..."
+    sudo tee /usr/local/bin/eggdrop-dbguard >/dev/null <<'RES_GUARD'
+#!/bin/bash
+# eggdrop-dbguard [BOTDIR]   (runs as root before every bot start; BOTDIR defaults to the current dir)
+# 1. recreates a missing db/ folder
+# 2. replaces a damaged/truncated .user/.chan file with the newest GOOD copy (~bak or hourly backup)
+# 3. brings back db files that vanished completely (e.g. after rm -rf db)
+# Never deletes anything: a damaged file is kept as FILE.broken.
+dir=${1:-$(pwd)}; db="$dir/db"; bk=${EGG_BACKUP_DIR:-/var/backups/eggdrop}
+log() { logger -t eggdrop-dbguard "$*" 2>/dev/null; echo "eggdrop-dbguard: $*"; }
+valid() {
+  [ -s "$1" ] || return 1
+  case "$1" in
+    *.user|*.user~bak) [ "$(head -c 4 "$1" 2>/dev/null)" = "#4v:" ] ;;
+    *)                 [ "$(head -c 1 "$1" 2>/dev/null)" = "#" ] ;;
+  esac
+}
+own=$(stat -c %U:%G "$dir" 2>/dev/null) || exit 0
+if [ ! -d "$db" ]; then
+  mkdir -p "$db" && chown "$own" "$db" && chmod 775 "$db"
+  log "$dir: db/ was missing - recreated"
+fi
+# damaged files
+for f in "$db"/*.user "$db"/*.chan; do
+  [ -e "$f" ] || continue
+  valid "$f" && continue
+  key=$(printf '%s' "$f" | tr / _)
+  good=""
+  for c in $(ls -1t "$f~bak" "$bk/$key".h.* "$bk/$key".d.* 2>/dev/null); do
+    if valid "$c"; then good=$c; break; fi
+  done
+  cp -p "$f" "$f.broken" 2>/dev/null
+  if [ -n "$good" ]; then
+    cp -p "$good" "$f" && chown "$own" "$f" && chmod 600 "$f" && log "$f was damaged - restored from $good"
+  else
+    log "$f is damaged and there is NO good copy"
+  fi
+done
+# vanished files
+prefix=$(printf '%s/' "$db" | tr / _)
+for c in $(ls -1t "$bk/$prefix"* 2>/dev/null); do
+  b=${c##*/}; rest=${b#"$prefix"}; name=${rest%%.[hd].*}
+  [ -n "$name" ] && [ ! -e "$db/$name" ] || continue
+  valid "$c" || continue
+  cp -p "$c" "$db/$name" && chown "$own" "$db/$name" && chmod 600 "$db/$name" && log "$db/$name was missing - restored from $c"
+done
+exit 0
+RES_GUARD
+    sudo tee /usr/local/bin/eggdrop-dbbackup >/dev/null <<'RES_BACKUP'
+#!/bin/bash
+# eggdrop-dbbackup   (run by eggdrop-dbbackup.timer every 30 min)
+# Saves every VALID userfile/chanfile: 48 half-hourly copies + 14 daily copies per file.
+# A damaged file is never copied, so a good backup always survives.
+bk=${EGG_BACKUP_DIR:-/var/backups/eggdrop}; homes=${EGG_HOMES:-/home}
+mkdir -p "$bk"; chmod 700 "$bk"
+stamp=$(date +%Y%m%d-%H%M); day=$(date +%Y%m%d)
+valid() {
+  [ -s "$1" ] || return 1
+  case "$1" in
+    *.user) [ "$(head -c 4 "$1")" = "#4v:" ] ;;
+    *)      [ "$(head -c 1 "$1")" = "#" ] ;;
+  esac
+}
+for f in "$homes"/*/*/db/*.user "$homes"/*/*/db/*.chan; do
+  [ -f "$f" ] || continue
+  valid "$f" || continue
+  key=$(printf '%s' "$f" | tr / _)
+  last=$(ls -1t "$bk/$key".h.* 2>/dev/null | head -1)
+  if [ -z "$last" ] || ! cmp -s "$f" "$last"; then cp -p "$f" "$bk/$key.h.$stamp"; fi
+  [ -e "$bk/$key.d.$day" ] || cp -p "$f" "$bk/$key.d.$day"
+  ls -1t "$bk/$key".h.* 2>/dev/null | tail -n +49 | xargs -r rm -f
+  ls -1t "$bk/$key".d.* 2>/dev/null | tail -n +15 | xargs -r rm -f
+done
+exit 0
+RES_BACKUP
+    sudo tee /usr/local/bin/eggdrop-stagger >/dev/null <<'RES_STAGGER'
+#!/bin/bash
+# eggdrop-stagger: right after a reboot, spread bot starts over ~90 s so dozens of bots
+# do not hit the IRC server (and the WARP tunnels) in the same second.
+up=$(cut -d. -f1 /proc/uptime)
+[ "${up:-9999}" -lt 400 ] || exit 0
+sleep $(( $(pwd | cksum | cut -d' ' -f1) % 90 ))
+exit 0
+RES_STAGGER
+    sudo tee /usr/local/bin/eggdrop-doctor >/dev/null <<'RES_DOCTOR'
+#!/bin/bash
+# eggdrop-doctor [--start]
+# One command to check and repair the whole shell server after an outage.
+#   (no option)  check/repair userfiles, find duplicate bots, failed services, orphan services
+#   --start      also start every enabled bot that is not running, one by one (20 s apart)
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+echo "== 1. userfiles (damaged ones are restored from the newest good copy)"
+n=0
+for d in /home/*/*/db; do
+  ls "$d"/*.user >/dev/null 2>&1 || continue
+  eggdrop-dbguard "$(dirname "$d")"; n=$((n+1))
+done
+echo "   checked $n bot folders"
+echo "== 2. bots running more than once"
+dups=$(ps -eo user:20,args | awk '$2 ~ /eggdrop$/ {print $1, $NF}' | sort | uniq -d)
+[ -n "$dups" ] && echo "$dups" || echo "   none"
+echo "== 3. enabled bot services that are not running"
+bad=0
+for u in $(systemctl list-unit-files 'eggdrop-*.service' --no-legend | awk '$2=="enabled"{print $1}'); do
+  s=$(systemctl is-active "$u")
+  [ "$s" = active ] || { echo "   $u: $s"; bad=1; }
+done
+[ $bad = 0 ] && echo "   all running"
+echo "== 4. services whose Linux user no longer exists"
+orph=0
+for f in /etc/systemd/system/*.service; do
+  [ -f "$f" ] || continue
+  u=$(sed -n 's/^User=//p' "$f" | head -1)
+  [ -n "$u" ] && ! getent passwd "$u" >/dev/null && { echo "   $(basename "$f") (user '$u' is gone)"; orph=1; }
+done
+[ $orph = 0 ] && echo "   none"
+if [ "${1:-}" = "--start" ]; then
+  echo "== 5. starting stopped bots, one at a time"
+  for u in $(systemctl list-unit-files 'eggdrop-*.service' --no-legend | awk '$2=="enabled"{print $1}'); do
+    systemctl is-active -q "$u" && continue
+    echo "   starting $u"; systemctl start "$u"; sleep 20
+  done
+fi
+exit 0
+RES_DOCTOR
+    sudo tee /etc/systemd/system/eggdrop-dbbackup.service >/dev/null <<'RES_BKSVC'
+[Unit]
+Description=Back up Eggdrop userfiles and channel files
+[Service]
+Type=oneshot
+Nice=19
+ExecStart=/usr/local/bin/eggdrop-dbbackup
+RES_BKSVC
+    sudo tee /etc/systemd/system/eggdrop-dbbackup.timer >/dev/null <<'RES_BKTMR'
+[Unit]
+Description=Back up Eggdrop userfiles every 30 minutes
+[Timer]
+OnBootSec=5min
+OnCalendar=*:0/30
+Persistent=true
+[Install]
+WantedBy=timers.target
+RES_BKTMR
+    # outage-safe replacement for the old watchdog (only if the WARP toolkit is in use)
+    if [ -f /usr/local/bin/warpns-watchdog ] || [ -d /etc/warpns ]; then
+    sudo tee /usr/local/bin/warpns-watchdog >/dev/null <<'RES_WD'
+#!/bin/bash
+# Run every minute by warpns-watchdog.timer.
+# Heals a dead WARP tunnel - but ONLY while this machine itself has internet.
+# When the whole connection is down (overdue bill, router off) every tunnel looks dead; restarting
+# them would kill all bots in the middle of saving their userfiles and shuffle UDP ports for nothing.
+st=/run/warpns-watchdog; mkdir -p "$st"
+ports=(4500 2408 500 1701)
+host_online() {
+  ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 || \
+    curl -4 -s -m 6 -o /dev/null https://1.1.1.1
+}
+alive() { ip netns exec "$1" curl -6 -s -m 8 -o /dev/null https://ipv6.icanhazip.com; }
+now=$(date +%s)
+if ! host_online; then
+  [ -e "$st/offline" ] || logger -t warpns-watchdog "no internet on the host - leaving tunnels and bots alone"
+  touch "$st/offline"; rm -f "$st"/*.fails "$st"/*.restarts; exit 0
+fi
+if [ -e "$st/offline" ]; then
+  rm -f "$st/offline"; echo "$now" > "$st/back"
+  logger -t warpns-watchdog "internet is back - waiting 5 minutes before touching any tunnel"
+fi
+if [ -e "$st/back" ] && [ $(( now - $(cat "$st/back") )) -lt 300 ]; then exit 0; fi
+for f in /etc/warpns/*.conf; do
+  [ -f "$f" ] || continue
+  n=$(basename "$f" .conf)
+  ip netns list | grep -qw "$n" || continue
+  if alive "$n"; then rm -f "$st/$n.fails" "$st/$n.restarts"; continue; fi
+  c=$(( $(cat "$st/$n.fails" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$st/$n.fails"
+  [ "$c" -ge 3 ] || continue                                   # 3 failed checks in a row
+  if [ -e "$st/$n.last" ] && [ $(( now - $(stat -c %Y "$st/$n.last") )) -lt 600 ]; then continue; fi  # 10 min cooldown
+  touch "$st/$n.last"; echo 0 > "$st/$n.fails"
+  r=$(( $(cat "$st/$n.restarts" 2>/dev/null || echo 0) + 1 )); echo "$r" > "$st/$n.restarts"
+  logger -t warpns-watchdog "tunnel $n is dead (internet is up) - restarting it"
+  systemctl restart "wgns@$n"; sleep 12
+  if alive "$n"; then rm -f "$st/$n.restarts"; continue; fi
+  if [ "$r" -ge 2 ]; then                                       # only change port after 2 failed restarts
+    cur=$(grep -oE '^Endpoint = [0-9.]+:[0-9]+' "$f" | grep -oE '[0-9]+$')
+    next=4500
+    for i in 0 1 2 3; do [ "${ports[$i]}" = "$cur" ] && next=${ports[$(( (i+1) % 4 ))]}; done
+    sed -i -E "s|^(Endpoint = [0-9.]+:)[0-9]+|\1$next|" "$f"
+    logger -t warpns-watchdog "tunnel $n still dead - switching UDP port $cur -> $next"
+    systemctl restart "wgns@$n"
+  fi
+done
+exit 0
+RES_WD
+    fi
+    sudo chmod +x /usr/local/bin/eggdrop-dbguard /usr/local/bin/eggdrop-dbbackup \
+                  /usr/local/bin/eggdrop-stagger /usr/local/bin/eggdrop-doctor
+    if [ -f /usr/local/bin/warpns-watchdog ] || [ -d /etc/warpns ]; then
+        sudo chmod +x /usr/local/bin/warpns-watchdog
+    fi
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now eggdrop-dbbackup.timer >/dev/null 2>&1
+    sudo systemctl start eggdrop-dbbackup.service >/dev/null 2>&1 || true
+    ohai "Resilience toolkit ${tty_green}ready${tty_reset}.  Check everything any time with: ${tty_green}sudo eggdrop-doctor${tty_reset}"
+    echo
+}
+
+# Attach the auto-repair + staggered start to one bot service  (name like eggdrop-Selene)
+resilience_attach_service() {
+    local s="${1%.service}"
+    [ -f "/etc/systemd/system/${s}.service" ] || return 0
+    sudo mkdir -p "/etc/systemd/system/${s}.service.d"
+    sudo tee "/etc/systemd/system/${s}.service.d/resilience.conf" >/dev/null <<'RES_DROPIN'
+[Service]
+ExecStartPre=-+/usr/local/bin/eggdrop-dbguard
+ExecStartPre=-+/usr/local/bin/eggdrop-stagger
+TimeoutStartSec=300
+TimeoutStopSec=60
+RestartSec=30
+RES_DROPIN
+}
+
+# ./installer.sh -r : add the toolkit to every bot that already exists on this server
+resilience_retrofit_all() {
+    install_resilience_toolkit || return 1
+    local f n count=0
+    for f in /etc/systemd/system/eggdrop-*.service; do
+        [ -f "$f" ] || continue
+        n="$(basename "$f" .service)"
+        resilience_attach_service "$n"
+        count=$((count + 1))
+    done
+    sudo systemctl daemon-reload
+    ohai "Attached to ${tty_green}${count}${tty_reset} bot service(s). Active from each bot's next (re)start - nothing was restarted."
+    echo "    Now run:  ${tty_green}sudo eggdrop-doctor${tty_reset}"
+    echo
+}
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 
 usage() {
     echo
     echo "PinoyChat Eggdrop Installer (BlackTools or A&A)"
-    echo "Usage: ./install.sh [options]"
+    echo "Usage: ./installer.sh [options]"
     echo "    -i              Install Eggdrop + your choice of BlackTools or A&A"
+    echo "    -r              Retrofit resilience (backups, auto-repair) onto all existing bots"
     echo "    -h, --help      Display this message"
     echo
     exit "${1:-0}"
@@ -2857,6 +3137,9 @@ install_bot() {
     # -- optional: private Cloudflare WARP tunnel (own IPv6) for this bot
     ask_for_warp
 
+    # -- backups, auto-repair, outage-safe watchdog
+    install_resilience_toolkit
+
     download_eggdrop
 
     # ── BlackTools branch ─────────────────────────────────────────────────────
@@ -2893,6 +3176,7 @@ if [[ $# -gt 0 ]]; then
     case "$1" in
         -h | --help) usage ;;
         -i) install_bot; exit 0 ;;
+        -r) resilience_retrofit_all; exit 0 ;;
         *)
             warn "Unrecognized option: '$1'"
             usage 1
