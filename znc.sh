@@ -6,27 +6,31 @@
 #       bash <(curl -fsSL https://bot.pinoychat.fun/znc.sh)
 #
 # What it does
-#   1. installs ZNC: the LATEST stable release compiled from source (default),
-#      or the older apt version if you answer n or the build fails
-#   2. asks a few questions and writes ~/znc-NAME/configs/znc.conf
+#   1. detects your OS and package manager (same idea as installer.sh), shows the exact
+#      prerequisite packages and installs them after you confirm
+#   2. installs ZNC: the LATEST stable release compiled from source (Linux), or the
+#      package-manager version (apt/dnf/yum/pkg/brew) if you answer n or the build fails
+#   3. asks a few questions and writes ~/znc-NAME/configs/znc.conf
 #      (SSL listener for IRC *and* the web portal, webadmin loaded, user = admin)
-#   3. creates a systemd service  znc-NAME  (starts on boot, restarts if it dies)
-#   4. optional: installs an ident server (oidentd) so IRC shows your ident instead of ~user
-#   5. optional: runs that ZNC inside its OWN Cloudflare WARP tunnel (own IPv6/IPv4)
+#   4. creates a systemd service znc-NAME (Linux), or start.sh/stop.sh where there is no systemd
+#   5. optional: ident server (oidentd) so IRC shows your ident instead of ~user   (Linux)
+#   6. optional: runs that ZNC inside its OWN Cloudflare WARP tunnel                (Debian/Ubuntu)
 #      - the tunnel tools come from installer.sh (WARP_SOURCE below), nothing is duplicated
 #      - a small forwarder (znc-fwd-NAME) lets your IRC client still reach the ZNC port
 #
-# Debian / Ubuntu / Raspberry Pi OS with systemd only.
+# Supported systems
+#   Linux with apt (Debian / Ubuntu / Raspberry Pi OS), dnf or yum (Fedora / RHEL / CentOS / Alma / Rocky)
+#   FreeBSD (pkg), macOS (Homebrew)
+#   Source build, ident, WARP and systemd service are Linux features; BSD/macOS use the packaged ZNC.
 #
 # Changes in this version
+#   - NEW: OS + package-manager detection, prerequisite list shown and installed on confirmation
+#   - NEW: works on RHEL-family Linux, FreeBSD and macOS too (not only Debian/Ubuntu)
+#   - NEW: opens firewalld ports as well as ufw
 #   - FIX: global "LoadModule = webadmin" was missing, so the web portal showed a blank page
-#   - FIX: listener now has AllowIRC/AllowWeb/URIPrefix set explicitly
-#   - FIX: user is Admin so the whole web portal can be used
-#   - FIX: an empty znc.pem is detected (it makes ZNC drop every TLS handshake)
-#   - NEW: builds the latest ZNC from znc.in (apt on Ubuntu 20.04 only has 1.7.5)
 #   - FIX: the user is Admin, so "Network number limit reached" (MaxNetworks) no longer happens
-#   - NEW: optional ident server (oidentd), opens ufw ports if ufw is active
-#   - NEW: summary shows the real public IP, the web portal URL and a live web check
+#   - FIX: an empty znc.pem is detected (it makes ZNC drop every TLS handshake)
+#   - NEW: builds the latest ZNC from znc.in; summary shows the public IP and a live web check
 # --------------------------------------------------------------------------------------------
 
 set -u
@@ -34,12 +38,27 @@ set -u
 WARP_SOURCE="https://bot.pinoychat.fun/installer.sh"
 PORT_MIN=10000
 PORT_MAX=60000
-
-WANT_IDENT="0"
-WANT_LATEST="1"
-ZNC_BIN=""
 ZNC_FALLBACK_VER="1.10.3"   # used only if znc.in/releases cannot be read
+
+# -- detected system (filled by detect_os)
+OS=""
+SYSTEM=""
+PKG_FAMILY=""        # apt | dnf | yum | pkg | brew
+HAS_SYSTEMD=0
+CAN_BUILD=0          # compile the latest ZNC from source (Linux)
+CAN_IDENT=0          # oidentd (Linux + systemd)
+CAN_WARP=0           # Cloudflare WARP toolkit (Debian/Ubuntu + systemd)
+PREREQ_PKGS=""       # always needed
+BUILD_PKGS=""        # only needed for the source build
+OPT_PKGS=""          # nice to have (Argon2), failure is ignored
+ZNC_PKG="znc"
+
+# -- choices
+WANT_LATEST="0"
+WANT_IDENT="0"
+USE_WARP="0"
 IDENT_STATE="not installed"
+ZNC_BIN=""
 WARP_NS=""
 WARP_ADDR=""
 
@@ -70,42 +89,251 @@ ohai() { printf "${tty_blue}==>${tty_bold} %s${tty_reset}\n" "$(shell_join "$@")
 warn() { printf "${tty_yellow}Warning${tty_reset}: %s\n" "$(chomp "$1")" >&2; }
 abort() { printf "%s\n" "$@" >&2; exit 1; }
 ring_bell() { if [[ -t 1 ]]; then printf "\a"; fi; }
-check_sudo() {
-    command -v sudo >/dev/null 2>&1 || abort "${tty_red}Error:${tty_reset} sudo is required."
-}
 
+# all questions read from the terminal, so it also works with: bash <(curl ...) and curl ... | bash
 ask() { # ask VAR "question" "default" "regex" "error text"
     local var="$1" q="$2" def="$3" re="$4" err="$5" v
     while true; do
-        if [ -n "$def" ]; then read -r -p "    $q [$def]: " v; v="${v:-$def}"; else read -r -p "    $q: " v; fi
+        if [ -n "$def" ]; then read -r -p "    $q [$def]: " v </dev/tty; v="${v:-$def}"; else read -r -p "    $q: " v </dev/tty; fi
         if printf '%s' "$v" | grep -qE "$re"; then printf -v "$var" '%s' "$v"; return; fi
         echo "    ${tty_yellow}$err${tty_reset}"
     done
 }
 
+ask_yn() { # ask_yn "question" "y|n"  -> returns 0 for yes, 1 for no
+    local q="$1" def="${2:-y}" a hint
+    if [ "$def" = "y" ]; then hint="Y/n"; else hint="y/N"; fi
+    while true; do
+        printf '    %s [%s]: ' "$q" "$hint" >/dev/tty
+        IFS= read -r a </dev/tty || a=""
+        a="${a:-$def}"
+        case "$a" in
+            [Yy]*) return 0 ;;
+            [Nn]*) return 1 ;;
+        esac
+        echo "    ${tty_yellow}Answer y or n.${tty_reset}"
+    done
+}
+
 # ---------------------------------------------------------------------------
-# Checks and packages
+# Portable helpers (Linux / FreeBSD / macOS)
+# ---------------------------------------------------------------------------
+
+sha256_of() { # reads stdin, prints the hex sha256
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+    elif command -v sha256 >/dev/null 2>&1; then sha256 -q
+    else abort "${tty_red}Error:${tty_reset} no sha256 tool found (sha256sum / shasum / sha256)."
+    fi
+}
+
+has_ipv6() {
+    if [ -e /proc/net/if_inet6 ]; then return 0; fi
+    if command -v ifconfig >/dev/null 2>&1 && ifconfig 2>/dev/null | grep -q 'inet6 '; then return 0; fi
+    return 1
+}
+
+port_in_use() {
+    local p="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
+    else
+        netstat -an 2>/dev/null | grep -E "[.:]${p} .*LISTEN" >/dev/null 2>&1
+    fi
+}
+
+random_free_port() {
+    local p span=$(( PORT_MAX - PORT_MIN + 1 ))
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        p=$(( PORT_MIN + (RANDOM * 32768 + RANDOM) % span ))
+        if ! port_in_use "$p"; then echo "$p"; return 0; fi
+    done
+    return 1
+}
+
+check_sudo() {
+    command -v sudo >/dev/null 2>&1 || abort "${tty_red}Error:${tty_reset} sudo is required to install packages from this script."
+}
+
+# ---------------------------------------------------------------------------
+# Check the OS (same approach as installer.sh) and pick package manager + package names
+# ---------------------------------------------------------------------------
+
+detect_os() {
+    OS="$(uname)"
+    SYSTEM="$OS"
+    PKG_FAMILY=""; HAS_SYSTEMD=0; CAN_BUILD=0; CAN_IDENT=0; CAN_WARP=0
+
+    case "$OS" in
+        Linux)
+            if [ -r /etc/os-release ]; then
+                SYSTEM="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-Linux}")"
+            else
+                SYSTEM="Linux"
+            fi
+            if command -v apt-get >/dev/null 2>&1; then PKG_FAMILY="apt"
+            elif command -v dnf >/dev/null 2>&1; then PKG_FAMILY="dnf"
+            elif command -v yum >/dev/null 2>&1; then PKG_FAMILY="yum"
+            else
+                abort "${tty_red}Error:${tty_reset} no supported package manager found (need apt-get, dnf or yum)."
+            fi
+            if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then HAS_SYSTEMD=1; fi
+            CAN_BUILD=1
+            [ "$HAS_SYSTEMD" = "1" ] && CAN_IDENT=1
+            [ "$HAS_SYSTEMD" = "1" ] && [ "$PKG_FAMILY" = "apt" ] && CAN_WARP=1
+            ;;
+        FreeBSD)
+            SYSTEM="FreeBSD $(freebsd-version 2>/dev/null || uname -r)"
+            PKG_FAMILY="pkg"
+            ;;
+        Darwin)
+            SYSTEM="macOS $(sw_vers -productVersion 2>/dev/null)"
+            PKG_FAMILY="brew"
+            ;;
+        *)
+            abort "${tty_red}Error:${tty_reset} this installer supports Linux, FreeBSD and macOS (found: ${OS})."
+            ;;
+    esac
+
+    case "$PKG_FAMILY" in
+        apt)
+            PREREQ_PKGS="curl ca-certificates iproute2"
+            BUILD_PKGS="build-essential cmake pkg-config libssl-dev libicu-dev zlib1g-dev gettext"
+            OPT_PKGS="libargon2-dev"
+            ;;
+        dnf|yum)
+            PREREQ_PKGS="curl ca-certificates iproute"
+            BUILD_PKGS="gcc-c++ make cmake pkgconf-pkg-config openssl-devel libicu-devel zlib-devel gettext"
+            OPT_PKGS="libargon2-devel"
+            ;;
+        pkg)
+            PREREQ_PKGS="curl ca_root_nss"
+            ;;
+        brew)
+            PREREQ_PKGS=""
+            ;;
+    esac
+    ZNC_PKG="znc"
+}
+
+pkg_refresh() {
+    case "$PKG_FAMILY" in
+        apt) sudo apt-get update -qq >/dev/null 2>&1 || true ;;
+        pkg) sudo pkg update -q >/dev/null 2>&1 || true ;;
+    esac
+}
+
+pkg_install() { # pkg_install PKG...
+    case "$PKG_FAMILY" in
+        apt)  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        dnf)  sudo dnf install -y "$@" ;;
+        yum)  sudo yum install -y "$@" ;;
+        pkg)  sudo pkg install -y "$@" ;;
+        brew) brew install "$@" ;;
+    esac
+}
+
+pkg_install_cmd_text() { # prints the command shown to the user
+    case "$PKG_FAMILY" in
+        apt)  printf 'sudo apt-get install -y %s' "$*" ;;
+        dnf)  printf 'sudo dnf install -y %s' "$*" ;;
+        yum)  printf 'sudo yum install -y %s' "$*" ;;
+        pkg)  printf 'sudo pkg install -y %s' "$*" ;;
+        brew) printf 'brew install %s' "$*" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Checks and prerequisites
 # ---------------------------------------------------------------------------
 
 preflight() {
     [ -n "${BASH_VERSION:-}" ] || abort "Bash is required to run this script."
     [ "$(id -u)" != "0" ] || abort "${tty_red}Error:${tty_reset} do not run this as root. Log in as your normal user (the script uses sudo when needed)."
-    command -v apt-get >/dev/null 2>&1 || abort "${tty_red}Error:${tty_reset} this installer needs Debian/Ubuntu (apt)."
-    command -v systemctl >/dev/null 2>&1 || abort "${tty_red}Error:${tty_reset} this installer needs systemd."
-    check_sudo
-    sudo -v || abort "${tty_red}Error:${tty_reset} sudo failed."
+    detect_os
+    if [ "$PKG_FAMILY" = "brew" ]; then
+        command -v brew >/dev/null 2>&1 || abort "${tty_red}Error:${tty_reset} Homebrew is required on macOS: https://brew.sh"
+    else
+        check_sudo
+        sudo -v || abort "${tty_red}Error:${tty_reset} sudo failed."
+    fi
 }
 
-install_packages() {
-    ohai "Installing packages (socat, openssl, curl)..."
-    sudo apt-get update -qq >/dev/null 2>&1 || true
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y socat openssl curl ca-certificates iproute2 \
-        || abort "${tty_red}Error:${tty_reset} package install failed."
+# the packages that will be installed, depending on the chosen method
+prereq_list() {
+    local l="$PREREQ_PKGS"
+    if [ "$WANT_LATEST" = "1" ]; then l="$l $BUILD_PKGS"; fi
+    printf '%s' "$l" | tr -s ' ' | sed 's/^ //; s/ $//'
+}
+
+install_prereq() {
+    local pk
+    pk="$(prereq_list)"
+    ohai "Installing prerequisites..."
+    pkg_refresh
+    # shellcheck disable=SC2086
+    pkg_install $pk || abort "${tty_red}Error:${tty_reset} Package install failed. Please correct and try again."
+    echo
+    ohai "Done!"
+    echo
+}
+
+ask_for_prereq() {
+    local pk
+    pk="$(prereq_list)"
+    [ -n "$pk" ] || return 0
+    echo
+    ohai "Install prerequisite packages for ${tty_green}${SYSTEM}${tty_reset}?"
+    echo
+    echo "    $(pkg_install_cmd_text $pk)"
+    echo
+    if ask_yn "Install them now?" "y"; then
+        install_prereq
+    else
+        warn "Skipping prerequisite install. The installer will fail if they are missing."
+        echo
+    fi
+}
+
+check_prereqs() {
+    local missing=0 cmd
+    local need="curl"
+    if [ "$WANT_LATEST" = "1" ]; then need="$need cmake make"; fi
+    for cmd in $need; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            ring_bell
+            echo "${tty_red}Error:${tty_reset} Required tool ${tty_bold}${cmd}${tty_reset} is not installed."
+            missing=1
+        fi
+    done
+    if [ "$WANT_LATEST" = "1" ] && ! command -v c++ >/dev/null 2>&1 && ! command -v g++ >/dev/null 2>&1; then
+        ring_bell
+        echo "${tty_red}Error:${tty_reset} Required tool ${tty_bold}a C++ compiler${tty_reset} is not installed."
+        missing=1
+    fi
+    if [ "$missing" -eq 1 ]; then
+        abort "Install the missing tools (or run again and answer y to the prerequisite question)."
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# ZNC itself: latest release from source, or apt as fallback
+# ZNC itself: latest release from source, or the package manager's version
 # ---------------------------------------------------------------------------
+
+ask_install_method() {
+    WANT_LATEST="0"
+    if [ "$CAN_BUILD" != "1" ]; then
+        echo
+        echo "    ZNC will be installed with ${tty_bold}${PKG_FAMILY}${tty_reset} (${PKG_FAMILY} normally carries a recent release)."
+        return 0
+    fi
+    echo
+    echo "    apt/dnf can carry an old ZNC (Ubuntu 20.04: 1.7.5; Debian 12: 1.8.2). Compiling gives the"
+    echo "    latest stable release with all security fixes, but takes 10-20 minutes."
+    if ask_yn "Install the LATEST ZNC from source?" "y"; then WANT_LATEST="1"; fi
+}
 
 znc_latest_version() {
     local page v
@@ -125,11 +353,9 @@ build_znc_latest() {
     fi
 
     ohai "Building ZNC ${ver} from source (10-20 minutes on a small VPS, please wait)..."
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config \
-        libssl-dev libicu-dev zlib1g-dev gettext >/dev/null 2>&1 \
-        || { warn "Could not install the build tools."; return 1; }
     # optional: lets ZNC use Argon2 password hashes
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libargon2-dev >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    [ -n "$OPT_PKGS" ] && { pkg_install $OPT_PKGS >/dev/null 2>&1 || true; }
 
     # small VPS: one job at a time, or the compiler runs out of RAM
     mem="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)"
@@ -172,14 +398,16 @@ install_znc() {
         if build_znc_latest; then
             ZNC_BIN="/usr/local/bin/znc"
         else
-            warn "Source build failed - falling back to the (older) ZNC from apt."
+            warn "Source build failed - falling back to the package manager's ZNC."
         fi
     fi
     if [ -z "$ZNC_BIN" ]; then
-        ohai "Installing ZNC from apt..."
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y znc \
-            || abort "${tty_red}Error:${tty_reset} znc install failed."
+        ohai "Installing ZNC with ${PKG_FAMILY}..."
+        pkg_refresh
+        pkg_install "$ZNC_PKG" || abort "${tty_red}Error:${tty_reset} znc install failed." \
+            "       On RHEL/CentOS/Alma/Rocky the znc package comes from EPEL: sudo dnf install -y epel-release"
         ZNC_BIN="$(command -v znc)"
+        if [ -z "$ZNC_BIN" ] && [ "$PKG_FAMILY" = "brew" ]; then ZNC_BIN="$(brew --prefix)/bin/znc"; fi
     fi
     [ -x "$ZNC_BIN" ] || abort "${tty_red}Error:${tty_reset} znc is not installed."
     ohai "Using $("$ZNC_BIN" --version 2>/dev/null | head -1)"
@@ -189,15 +417,6 @@ install_znc() {
 # Questions
 # ---------------------------------------------------------------------------
 
-random_free_port() {
-    local p
-    for _ in $(seq 1 60); do
-        p="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1)"
-        if ! ss -tln 2>/dev/null | grep -q ":$p "; then echo "$p"; return 0; fi
-    done
-    return 1
-}
-
 collect_settings() {
     echo
     echo "    ${tty_green}============================================================${tty_reset}"
@@ -206,8 +425,8 @@ collect_settings() {
     echo
     ask ZUSER   "ZNC username"                 "$(whoami)" '^[A-Za-z][A-Za-z0-9_-]{0,31}$' "Letters, digits, - and _ only, starting with a letter."
     while true; do
-        read -r -s -p "    ZNC password (min 8 characters, hidden): " P1; echo
-        read -r -s -p "    Repeat the password: " P2; echo
+        read -r -s -p "    ZNC password (min 8 characters, hidden): " P1 </dev/tty; echo
+        read -r -s -p "    Repeat the password: " P2 </dev/tty; echo
         [ "${#P1}" -ge 8 ] && [ "$P1" = "$P2" ] && break
         echo "    ${tty_yellow}Passwords must match and have at least 8 characters.${tty_reset}"
     done
@@ -217,12 +436,12 @@ collect_settings() {
     ask SERVER  "IRC server"                   "irc.undernet.org" '^[A-Za-z0-9.-]{3,80}$'   "A host name like irc.undernet.org"
     ask SPORT   "IRC server port"              "6667"      '^[0-9]{2,5}$'                   "A port number."
     ask SSLIRC  "SSL to the IRC server? (y/n)" "n"         '^[YyNn]$'                       "Answer y or n."
-    read -r -p "    Channels to join (e.g. #bislig #chat, or empty): " CHANS
+    read -r -p "    Channels to join (e.g. #bislig #chat, or empty): " CHANS </dev/tty
 
     local defport
     defport="$(random_free_port)" || abort "Could not find a free port."
     ask PORT    "Port for your IRC client / web portal" "$defport" '^[0-9]{2,5}$' "A port number."
-    if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+    if port_in_use "$PORT"; then
         abort "${tty_red}Error:${tty_reset} port $PORT is already in use on this machine. Run again and pick another."
     fi
 
@@ -231,42 +450,40 @@ collect_settings() {
     D="$HOME/znc-$INST"
     SVC="znc-$INST"
     [ ! -e "$D" ] || abort "${tty_red}Error:${tty_reset} $D already exists. Choose another ZNC username or remove that folder."
-    [ ! -f "/etc/systemd/system/$SVC.service" ] || abort "${tty_red}Error:${tty_reset} service $SVC already exists. Choose another ZNC username."
-
-    echo
-    echo "      apt only has an old ZNC on many systems (Ubuntu 20.04: 1.7.5). Compiling gives the"
-    echo "      latest stable release with all security fixes, but takes 10-20 minutes."
-    ask LATESTANS "Install the LATEST ZNC from source? (y/n)" "y" '^[YyNn]$' "Answer y or n."
-    case "$LATESTANS" in y|Y) WANT_LATEST="1" ;; *) WANT_LATEST="0" ;; esac
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+        [ ! -f "/etc/systemd/system/$SVC.service" ] || abort "${tty_red}Error:${tty_reset} service $SVC already exists. Choose another ZNC username."
+    fi
 
     USE_WARP="0"
-    echo
-    echo "    ${tty_green}============================================================${tty_reset}"
-    ohai "Run this ZNC inside its own ${tty_green}Cloudflare WARP${tty_reset} tunnel?"
-    echo "    ${tty_green}============================================================${tty_reset}"
-    echo
-    echo "      Hides this machine's IP and gives the ZNC its own address on IRC."
-    echo "      ${tty_yellow}Caution:${tty_reset} WARP addresses are shared by many people. Undernet bans them for"
-    echo "      'excessive connections' (1 day), and then the ZNC cannot connect."
-    echo "      A clean ident (no ~) is not possible through WARP."
-    echo
-    ask WARPANS "Use WARP? (y/n)" "n" '^[YyNn]$' "Answer y or n."
-    case "$WARPANS" in y|Y) USE_WARP="1" ;; esac
+    if [ "$CAN_WARP" = "1" ]; then
+        echo
+        echo "    ${tty_green}============================================================${tty_reset}"
+        ohai "Run this ZNC inside its own ${tty_green}Cloudflare WARP${tty_reset} tunnel?"
+        echo "    ${tty_green}============================================================${tty_reset}"
+        echo
+        echo "      Hides this machine's IP and gives the ZNC its own address on IRC."
+        echo "      ${tty_yellow}Caution:${tty_reset} WARP addresses are shared by many people. Undernet bans them for"
+        echo "      'excessive connections' (1 day), and then the ZNC cannot connect."
+        echo "      A clean ident (no ~) is not possible through WARP."
+        echo
+        if ask_yn "Use WARP?" "n"; then USE_WARP="1"; fi
+    fi
 
     WANT_IDENT="0"
-    echo
-    if [ "$USE_WARP" = "1" ]; then
-        echo "    Ident server skipped: it cannot work through a WARP tunnel."
-    else
-        echo "    ${tty_green}============================================================${tty_reset}"
-        ohai "Install an ${tty_green}ident server${tty_reset} (oidentd)?"
-        echo "    ${tty_green}============================================================${tty_reset}"
+    if [ "$CAN_IDENT" = "1" ]; then
         echo
-        echo "      Without it, IRC servers show you as ~${ZUSER}. With it, the ident is a clean '${ZUSER}'."
-        echo "      It listens on TCP port 113. One ident is used for every ZNC under this Linux user."
-        echo
-        ask IDANS "Install ident server? (y/n)" "y" '^[YyNn]$' "Answer y or n."
-        case "$IDANS" in y|Y) WANT_IDENT="1" ;; esac
+        if [ "$USE_WARP" = "1" ]; then
+            echo "    Ident server skipped: it cannot work through a WARP tunnel."
+        else
+            echo "    ${tty_green}============================================================${tty_reset}"
+            ohai "Install an ${tty_green}ident server${tty_reset} (oidentd)?"
+            echo "    ${tty_green}============================================================${tty_reset}"
+            echo
+            echo "      Without it, IRC servers show you as ~${ZUSER}. With it, the ident is a clean '${ZUSER}'."
+            echo "      It listens on TCP port 113. One ident is used for every ZNC under this Linux user."
+            echo
+            if ask_yn "Install ident server?" "y"; then WANT_IDENT="1"; fi
+        fi
     fi
 }
 
@@ -316,12 +533,12 @@ write_znc_config() {
 
     # IPv4 only when: inside a WARP tunnel (the forwarder connects to 127.0.0.1),
     # or when this machine has no IPv6 (ZNC refuses to start if it cannot bind IPv6)
-    if [ "$USE_WARP" = "1" ] || [ ! -e /proc/net/if_inet6 ]; then l6="false"; else l6="true"; fi
+    if [ "$USE_WARP" = "1" ] || ! has_ipv6; then l6="false"; else l6="true"; fi
 
     mkdir -p "$D/configs" || abort "Could not create $D"
     chmod 700 "$D"
     salt="$(head -c 60 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)"
-    hash="$(printf '%s%s' "$P1" "$salt" | sha256sum | cut -d' ' -f1)"
+    hash="$(printf '%s%s' "$P1" "$salt" | sha256_of)"
     # webadmin MUST be loaded globally (before the listener) or the web portal is blank.
     cat > "$D/configs/znc.conf" <<ZEOF
 Version = $ver
@@ -367,7 +584,7 @@ ZEOF
 }
 
 # ---------------------------------------------------------------------------
-# systemd service
+# Service: systemd on Linux, start.sh / stop.sh everywhere else
 # ---------------------------------------------------------------------------
 
 write_service() {
@@ -396,6 +613,28 @@ SVCEOF
     sudo systemctl enable "$SVC" >/dev/null 2>&1
 }
 
+write_manual_scripts() {
+    ohai "No systemd here - writing ${tty_green}start.sh${tty_reset} and ${tty_green}stop.sh${tty_reset} in ${D}"
+    cat > "$D/start.sh" <<STEOF
+#!/bin/sh
+# starts ZNC in the background
+cd "$D" || exit 1
+if [ -f "$D/znc.pid" ] && kill -0 "\$(cat "$D/znc.pid")" 2>/dev/null; then
+    echo "ZNC is already running (PID \$(cat "$D/znc.pid"))."; exit 0
+fi
+"$ZNC_BIN" --datadir="$D"
+STEOF
+    cat > "$D/stop.sh" <<SPEOF
+#!/bin/sh
+if [ -f "$D/znc.pid" ]; then
+    kill "\$(cat "$D/znc.pid")" && echo "ZNC stopped."
+else
+    pkill -f -- "--datadir=$D" && echo "ZNC stopped." || echo "ZNC is not running."
+fi
+SPEOF
+    chmod 755 "$D/start.sh" "$D/stop.sh"
+}
+
 # ---------------------------------------------------------------------------
 # Ident server (oidentd): replies with a clean ident for this Linux user
 # ---------------------------------------------------------------------------
@@ -409,14 +648,14 @@ setup_ident() {
     ohai "Installing the ident server (oidentd)..."
 
     # port 113 already taken by something that is not oidentd -> do not fight it
-    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE '[:.]113$' && ! pgrep -x oidentd >/dev/null 2>&1; then
+    if port_in_use 113 && ! pgrep -x oidentd >/dev/null 2>&1; then
         warn "Port 113 is already used by another ident service. oidentd was NOT installed."
         IDENT_STATE="skipped (port 113 busy)"
         return 0
     fi
 
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y oidentd >/dev/null 2>&1 \
-        || { warn "Could not install oidentd."; IDENT_STATE="failed (apt install)"; return 0; }
+    pkg_install oidentd >/dev/null 2>&1 \
+        || { warn "Could not install oidentd (on RHEL-family systems it needs EPEL)."; IDENT_STATE="failed (package install)"; return 0; }
 
     sudo touch "$cf"
     if sudo grep -qF "$marker" "$cf"; then
@@ -446,16 +685,24 @@ IDEOF
 }
 
 # ---------------------------------------------------------------------------
-# Firewall (only touches ufw, and only if it is active)
+# Firewall (only touches ufw / firewalld, and only if they are active)
 # ---------------------------------------------------------------------------
 
 open_firewall() {
-    command -v ufw >/dev/null 2>&1 || return 0
-    sudo ufw status 2>/dev/null | grep -q "^Status: active" || return 0
-    ohai "ufw is active - opening TCP ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' and 113')"
-    sudo ufw allow "${PORT}/tcp" >/dev/null 2>&1 || warn "Could not open ${PORT}/tcp in ufw."
-    if [ "$WANT_IDENT" = "1" ]; then
-        sudo ufw allow 113/tcp >/dev/null 2>&1 || warn "Could not open 113/tcp in ufw."
+    [ "$OS" = "Linux" ] || return 0
+    if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "^Status: active"; then
+        ohai "ufw is active - opening TCP ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' and 113')"
+        sudo ufw allow "${PORT}/tcp" >/dev/null 2>&1 || warn "Could not open ${PORT}/tcp in ufw."
+        if [ "$WANT_IDENT" = "1" ]; then
+            sudo ufw allow 113/tcp >/dev/null 2>&1 || warn "Could not open 113/tcp in ufw."
+        fi
+    elif command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then
+        ohai "firewalld is active - opening TCP ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' and 113')"
+        sudo firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null 2>&1 || warn "Could not open ${PORT}/tcp in firewalld."
+        if [ "$WANT_IDENT" = "1" ]; then
+            sudo firewall-cmd --permanent --add-port=113/tcp >/dev/null 2>&1 || warn "Could not open 113/tcp in firewalld."
+        fi
+        sudo firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 }
 
@@ -465,7 +712,8 @@ open_firewall() {
 
 setup_warp_znc() {
     local ip_bin socat_bin listen_addr
-    if [ -e /proc/net/if_inet6 ]; then
+    command -v socat >/dev/null 2>&1 || sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y socat >/dev/null 2>&1
+    if has_ipv6; then
         listen_addr="TCP6-LISTEN:${PORT},fork,reuseaddr,ipv6only=0"
     else
         listen_addr="TCP4-LISTEN:${PORT},fork,reuseaddr"
@@ -523,10 +771,18 @@ public_ip() {
     printf '%s' "$pip"
 }
 
+znc_is_running() {
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+        sudo systemctl is-active --quiet "$SVC"
+    else
+        pgrep -f -- "--datadir=$D" >/dev/null 2>&1
+    fi
+}
+
 show_summary() {
     local host pip code web="not answering yet"
     pip="$(public_ip)"
-    host="${pip:-$(hostname -f 2>/dev/null)}"
+    host="${pip:-$(hostname -f 2>/dev/null || hostname)}"
 
     # the web portal needs a few seconds after (re)start; plain GET, because HEAD hangs on ZNC
     for _ in 1 2 3 4 5 6; do
@@ -551,22 +807,34 @@ show_summary() {
     echo "      Username : ${tty_green}${ZUSER}${tty_reset}   (without /${NETNAME})"
     echo "      Check    : ${web}"
     echo
+    echo "    ${tty_bold}System    :${tty_reset} ${SYSTEM} (${PKG_FAMILY})"
     echo "    ${tty_bold}Config    :${tty_reset} ${D}/configs/znc.conf"
     if [ "$USE_WARP" = "1" ]; then
         echo "    ${tty_bold}WARP IPv6 :${tty_reset} ${WARP_ADDR:-unknown}   (tunnel ${WARP_NS:-?})"
     fi
     echo "    ${tty_bold}ZNC       :${tty_reset} $("$ZNC_BIN" --version 2>/dev/null | head -1)"
-    echo "    ${tty_bold}Ident     :${tty_reset} ${IDENT_STATE}"
-    if sudo systemctl is-active --quiet "$SVC"; then
+    if [ "$CAN_IDENT" = "1" ]; then
+        echo "    ${tty_bold}Ident     :${tty_reset} ${IDENT_STATE}"
+    fi
+    if znc_is_running; then
         echo "    ${tty_bold}Status    :${tty_reset} ${tty_green}Running${tty_reset}"
-    else
+    elif [ "$HAS_SYSTEMD" = "1" ]; then
         echo "    ${tty_bold}Status    :${tty_reset} ${tty_red}not running${tty_reset}  - check: sudo journalctl -u ${SVC} -n 30"
+    else
+        echo "    ${tty_bold}Status    :${tty_reset} ${tty_red}not running${tty_reset}  - start: ${D}/start.sh"
     fi
     echo
     echo "    ${tty_bold}Manage:${tty_reset}"
-    echo "      ${tty_green}sudo systemctl status  ${SVC}${tty_reset}"
-    echo "      ${tty_green}sudo systemctl restart ${SVC}${tty_reset}"
-    echo "      ${tty_green}sudo journalctl -u ${SVC} -n 40${tty_reset}"
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+        echo "      ${tty_green}sudo systemctl status  ${SVC}${tty_reset}"
+        echo "      ${tty_green}sudo systemctl restart ${SVC}${tty_reset}"
+        echo "      ${tty_green}sudo journalctl -u ${SVC} -n 40${tty_reset}"
+    else
+        echo "      ${tty_green}${D}/start.sh${tty_reset}"
+        echo "      ${tty_green}${D}/stop.sh${tty_reset}"
+        echo "      To start it at boot, add this line with  crontab -e :"
+        echo "      ${tty_green}@reboot ${D}/start.sh${tty_reset}"
+    fi
     echo
     echo "    If you cannot connect from outside, allow TCP port ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' (and 113 for ident)') in your"
     echo "    VPS provider's firewall / security group panel too."
@@ -584,7 +852,11 @@ main() {
     echo "    ${tty_green}============================================================${tty_reset}"
     echo
     preflight
-    install_packages
+    ohai "Detected ${tty_green}${SYSTEM}${tty_reset}. Using ${tty_bold}${PKG_FAMILY}${tty_reset} as package manager$([ "$HAS_SYSTEMD" = "1" ] && echo ' (systemd available)')."
+
+    ask_install_method
+    ask_for_prereq
+    check_prereqs
     collect_settings
     install_znc
 
@@ -597,7 +869,7 @@ main() {
     fi
 
     write_znc_config
-    write_service
+    if [ "$HAS_SYSTEMD" = "1" ]; then write_service; else write_manual_scripts; fi
     [ "$WANT_IDENT" = "1" ] && setup_ident
     open_firewall
 
@@ -607,8 +879,10 @@ main() {
             warn "WARP failed. ${SVC} is created but NOT started (it would show your real IP)."
             warn "Fix the tunnel, then run:  sudo warpns-bind ${SVC} ${WARP_NS:-NAME}"
         fi
-    else
+    elif [ "$HAS_SYSTEMD" = "1" ]; then
         sudo systemctl start "$SVC"
+    else
+        "$D/start.sh"
     fi
 
     show_summary
