@@ -24,9 +24,14 @@
 #   Source build, ident, WARP and systemd service are Linux features; BSD/macOS use the packaged ZNC.
 #
 # Changes in this version
+#   - FIX: /usr/sbin is added to PATH, so ufw / firewall-cmd / oidentd are found for a normal user
+#          (before, the firewall step was skipped silently and the ZNC port stayed blocked)
+#   - FIX: the firewall step now opens the ZNC port (and 113 for ident), checks that each rule
+#          really exists, and the summary shows the result
+#   - FIX: ident check also confirms that something listens on TCP 113; the summary explains
+#          what to do when /whois still shows ~user
 #   - NEW: OS + package-manager detection, prerequisite list shown and installed on confirmation
 #   - NEW: works on RHEL-family Linux, FreeBSD and macOS too (not only Debian/Ubuntu)
-#   - NEW: opens firewalld ports as well as ufw
 #   - FIX: global "LoadModule = webadmin" was missing, so the web portal showed a blank page
 #   - FIX: the user is Admin, so "Network number limit reached" (MaxNetworks) no longer happens
 #   - FIX: an empty znc.pem is detected (it makes ZNC drop every TLS handshake)
@@ -34,6 +39,9 @@
 # --------------------------------------------------------------------------------------------
 
 set -u
+
+# ufw, firewall-cmd, oidentd and friends live in /usr/sbin, which a normal user does not have in PATH
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 WARP_SOURCE="https://bot.pinoychat.fun/installer.sh"
 PORT_MIN=10000
@@ -58,6 +66,7 @@ WANT_LATEST="0"
 WANT_IDENT="0"
 USE_WARP="0"
 IDENT_STATE="not installed"
+FW_STATE="not checked"
 ZNC_BIN=""
 WARP_NS=""
 WARP_ADDR=""
@@ -676,11 +685,14 @@ IDEOF
     sudo systemctl enable oidentd >/dev/null 2>&1
     sudo systemctl restart oidentd >/dev/null 2>&1
     sleep 1
-    if sudo systemctl is-active --quiet oidentd; then
-        IDENT_STATE="oidentd running on port 113 (ident: ${ZUSER})"
-    else
+    if ! sudo systemctl is-active --quiet oidentd; then
         warn "oidentd did not start. Check: sudo journalctl -u oidentd -n 30"
         IDENT_STATE="installed but NOT running"
+    elif ! port_in_use 113; then
+        warn "oidentd is running but nothing listens on TCP 113. Check: sudo journalctl -u oidentd -n 30"
+        IDENT_STATE="running but NOT listening on port 113"
+    else
+        IDENT_STATE="oidentd running on port 113 (ident: ${ZUSER})"
     fi
 }
 
@@ -689,20 +701,47 @@ IDEOF
 # ---------------------------------------------------------------------------
 
 open_firewall() {
-    [ "$OS" = "Linux" ] || return 0
-    if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "^Status: active"; then
-        ohai "ufw is active - opening TCP ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' and 113')"
-        sudo ufw allow "${PORT}/tcp" >/dev/null 2>&1 || warn "Could not open ${PORT}/tcp in ufw."
-        if [ "$WANT_IDENT" = "1" ]; then
-            sudo ufw allow 113/tcp >/dev/null 2>&1 || warn "Could not open 113/tcp in ufw."
+    [ "$OS" = "Linux" ] || { FW_STATE="not needed on this system"; return 0; }
+    local p ports="$PORT" failed=""
+    [ "$WANT_IDENT" = "1" ] && ports="$ports 113"
+
+    if command -v ufw >/dev/null 2>&1; then
+        if sudo ufw status 2>/dev/null | grep -q "^Status: active"; then
+            ohai "ufw is active - opening TCP ${ports}"
+            for p in $ports; do
+                sudo ufw allow "${p}/tcp" >/dev/null 2>&1
+                if sudo ufw status 2>/dev/null | grep -qE "^${p}/tcp +ALLOW"; then
+                    echo "    ufw: ${p}/tcp open"
+                else
+                    warn "Could not open ${p}/tcp in ufw. Run: sudo ufw allow ${p}/tcp"
+                    failed="$failed $p"
+                fi
+            done
+            if [ -z "$failed" ]; then FW_STATE="ufw: TCP ${ports} open"
+            else FW_STATE="ufw: FAILED to open${failed} - run: sudo ufw allow PORT/tcp"; fi
+            return 0
         fi
-    elif command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then
-        ohai "firewalld is active - opening TCP ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' and 113')"
-        sudo firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null 2>&1 || warn "Could not open ${PORT}/tcp in firewalld."
-        if [ "$WANT_IDENT" = "1" ]; then
-            sudo firewall-cmd --permanent --add-port=113/tcp >/dev/null 2>&1 || warn "Could not open 113/tcp in firewalld."
-        fi
+        FW_STATE="ufw is installed but inactive (nothing blocked on this machine)"
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then
+        ohai "firewalld is active - opening TCP ${ports}"
+        for p in $ports; do
+            if sudo firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1; then
+                echo "    firewalld: ${p}/tcp open"
+            else
+                warn "Could not open ${p}/tcp in firewalld."
+                failed="$failed $p"
+            fi
+        done
         sudo firewall-cmd --reload >/dev/null 2>&1 || true
+        if [ -z "$failed" ]; then FW_STATE="firewalld: TCP ${ports} open"
+        else FW_STATE="firewalld: FAILED to open${failed}"; fi
+        return 0
+    fi
+
+    if [ "$FW_STATE" = "not checked" ]; then
+        FW_STATE="no active ufw/firewalld found (check your VPS provider's firewall panel)"
     fi
 }
 
@@ -805,7 +844,7 @@ show_summary() {
     echo "    ${tty_bold}Web portal:${tty_reset}"
     echo "      URL      : ${tty_green}https://${host:-YOUR_IP}:${PORT}/${tty_reset}   (type https://, accept the certificate warning)"
     echo "      Username : ${tty_green}${ZUSER}${tty_reset}   (without /${NETNAME})"
-    echo "      Check    : ${web}"
+    echo "      Check    : ${web}   (local test on this machine only)"
     echo
     echo "    ${tty_bold}System    :${tty_reset} ${SYSTEM} (${PKG_FAMILY})"
     echo "    ${tty_bold}Config    :${tty_reset} ${D}/configs/znc.conf"
@@ -816,6 +855,7 @@ show_summary() {
     if [ "$CAN_IDENT" = "1" ]; then
         echo "    ${tty_bold}Ident     :${tty_reset} ${IDENT_STATE}"
     fi
+    echo "    ${tty_bold}Firewall  :${tty_reset} ${FW_STATE}"
     if znc_is_running; then
         echo "    ${tty_bold}Status    :${tty_reset} ${tty_green}Running${tty_reset}"
     elif [ "$HAS_SYSTEMD" = "1" ]; then
@@ -836,8 +876,15 @@ show_summary() {
         echo "      ${tty_green}@reboot ${D}/start.sh${tty_reset}"
     fi
     echo
-    echo "    If you cannot connect from outside, allow TCP port ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' (and 113 for ident)') in your"
+    echo "    The checks above run on this machine, so they cannot see a firewall in front of it."
+    echo "    Test from ANOTHER computer. If you cannot connect, allow TCP port ${PORT}$([ "$WANT_IDENT" = "1" ] && echo ' (and 113 for ident)') in your"
     echo "    VPS provider's firewall / security group panel too."
+    if [ "$WANT_IDENT" = "1" ]; then
+        echo
+        echo "    Ident: after the ZNC connects, /whois ${NICK} should show '${ZUSER}@', not '~${ZUSER}@'."
+        echo "    If it still shows ~${ZUSER}, the IRC server cannot reach TCP 113 on this machine:"
+        echo "    open 113 in every firewall, then reconnect with:  ${tty_green}sudo systemctl restart ${SVC}${tty_reset}"
+    fi
     echo
 }
 
