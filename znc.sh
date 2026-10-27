@@ -24,6 +24,8 @@
 #   Source build, ident, WARP and systemd service are Linux features; BSD/macOS use the packaged ZNC.
 #
 # Changes in this version
+#   - NEW: optional Let's Encrypt certificate for the ZNC (no browser warning); kept up to date by a
+#          certbot deploy hook. Open the web portal by the domain name, not the IP
 #   - FIX: /usr/sbin is added to PATH, so ufw / firewall-cmd / oidentd are found for a normal user
 #          (before, the firewall step was skipped silently and the ZNC port stayed blocked)
 #   - FIX: the firewall step now opens the ZNC port (and 113 for ident), checks that each rule
@@ -67,6 +69,7 @@ WANT_IDENT="0"
 USE_WARP="0"
 IDENT_STATE="not installed"
 FW_STATE="not checked"
+LE_DOMAIN=""
 ZNC_BIN=""
 WARP_NS=""
 WARP_ADDR=""
@@ -494,6 +497,19 @@ collect_settings() {
             if ask_yn "Install ident server?" "y"; then WANT_IDENT="1"; fi
         fi
     fi
+
+    LE_DOMAIN=""
+    if [ "$OS" = "Linux" ] && [ "$HAS_SYSTEMD" = "1" ] && [ "$USE_WARP" != "1" ]; then
+        local le_first
+        le_first="$(sudo sh -c 'for d in /etc/letsencrypt/live/*/; do [ -f "${d}fullchain.pem" ] && basename "$d"; done' 2>/dev/null | head -1)"
+        if [ -n "$le_first" ]; then
+            echo
+            echo "    A Let's Encrypt certificate for ${tty_green}${le_first}${tty_reset} is installed on this machine."
+            echo "    Using it removes the browser warning when you open the web portal as https://${le_first}:PORT/"
+            echo "    (a copy of the certificate is kept in your ZNC folder and renewed automatically)."
+            if ask_yn "Use it for the ZNC?" "y"; then LE_DOMAIN="$le_first"; fi
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -590,6 +606,38 @@ ZEOF
         rm -f "$D/znc.pem"
         echo "failed (ZNC will have no SSL certificate; retry: $ZNC_BIN --datadir=$D --makepem)"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Let's Encrypt certificate (optional): replaces the self-signed znc.pem
+# ---------------------------------------------------------------------------
+
+use_letsencrypt() {
+    [ -n "$LE_DOMAIN" ] || return 0
+    local live="/etc/letsencrypt/live/${LE_DOMAIN}"
+    local hook="/etc/letsencrypt/renewal-hooks/deploy/znc-${INST}.sh"
+    local me grp
+    me="$(whoami)"; grp="$(id -gn)"
+
+    ohai "Installing the Let's Encrypt certificate for ${tty_green}${LE_DOMAIN}${tty_reset}..."
+    if ! sudo sh -c "cat '${live}/privkey.pem' '${live}/fullchain.pem' > '${D}/znc.pem'"; then
+        warn "Could not copy the certificate. The ZNC keeps its self-signed certificate."
+        LE_DOMAIN=""
+        return 0
+    fi
+    sudo chown "${me}:${grp}" "${D}/znc.pem"
+    sudo chmod 600 "${D}/znc.pem"
+
+    # certbot runs this after every renewal, so znc.pem never expires
+    sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    sudo tee "$hook" >/dev/null <<LEEOF
+#!/bin/sh
+cat ${live}/privkey.pem ${live}/fullchain.pem > ${D}/znc.pem
+chown ${me}:${grp} ${D}/znc.pem
+chmod 600 ${D}/znc.pem
+systemctl restart ${SVC} 2>/dev/null || true
+LEEOF
+    sudo chmod 755 "$hook"
 }
 
 # ---------------------------------------------------------------------------
@@ -822,6 +870,7 @@ show_summary() {
     local host pip code web="not answering yet"
     pip="$(public_ip)"
     host="${pip:-$(hostname -f 2>/dev/null || hostname)}"
+    [ -n "$LE_DOMAIN" ] && host="$LE_DOMAIN"
 
     # the web portal needs a few seconds after (re)start; plain GET, because HEAD hangs on ZNC
     for _ in 1 2 3 4 5 6; do
@@ -856,6 +905,11 @@ show_summary() {
         echo "    ${tty_bold}Ident     :${tty_reset} ${IDENT_STATE}"
     fi
     echo "    ${tty_bold}Firewall  :${tty_reset} ${FW_STATE}"
+    if [ -n "$LE_DOMAIN" ]; then
+        echo "    ${tty_bold}Certificate:${tty_reset} Let's Encrypt for ${LE_DOMAIN} (use this NAME, not the IP, or the browser still warns)"
+    else
+        echo "    ${tty_bold}Certificate:${tty_reset} self-signed (the browser warns once: Advanced > Continue)"
+    fi
     if znc_is_running; then
         echo "    ${tty_bold}Status    :${tty_reset} ${tty_green}Running${tty_reset}"
     elif [ "$HAS_SYSTEMD" = "1" ]; then
@@ -916,6 +970,7 @@ main() {
     fi
 
     write_znc_config
+    use_letsencrypt
     if [ "$HAS_SYSTEMD" = "1" ]; then write_service; else write_manual_scripts; fi
     [ "$WANT_IDENT" = "1" ] && setup_ident
     open_firewall
