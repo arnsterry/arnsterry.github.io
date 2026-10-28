@@ -61,9 +61,15 @@ while true; do
     unset SERVER_NUMERIC
 done
 
-while [ -z "$LINK_PASS" ]; do
-    echo "3) Link password. Must be EXACTLY the one the hub admin puts in the hub."
-    read -r -s -p "   Link password (typing is hidden): " LINK_PASS; echo ""
+while true; do
+    if [ -z "$LINK_PASS" ]; then
+        echo "3) Link password (you choose it; the hub gets it through the join code)."
+        echo "   Letters, numbers and . _ - only, at least 8 characters."
+        read -r -s -p "   Link password (typing is hidden): " LINK_PASS; echo ""
+    fi
+    if [[ "$LINK_PASS" =~ ^[A-Za-z0-9._-]{8,}$ ]]; then break; fi
+    echo "   Not valid. Use 8+ characters: letters, numbers, dot, underscore, dash."
+    unset LINK_PASS
 done
 
 echo ""
@@ -435,6 +441,10 @@ Server:        $SERVER_NAME   numeric $SERVER_NUMERIC   IP $SERVER_IP   port $LI
 CRED_EOF
 chmod 600 "$CRED"
 
+JOIN_CODE=$(printf '%s|%s|%s|%s' "$SERVER_NAME" "$SERVER_NUMERIC" "$SERVER_IP" "$LINK_PASS" | base64 -w0)
+printf '%s\n' "$JOIN_CODE" > "$INSTALL_PATH/JOIN_CODE.txt"
+chmod 600 "$INSTALL_PATH/JOIN_CODE.txt"
+
 HUBREQ="$INSTALL_PATH/SEND_TO_HUB_ADMIN.txt"
 cat > "$HUBREQ" << HUB_EOF
 Please add this to the hub ($HUB_NAME) ircd.conf, then /rehash:
@@ -500,7 +510,7 @@ fi
 if timeout 5 bash -c "exec 3<>/dev/tcp/$HUB_IP/$HUB_PORT" 2>/dev/null; then
     HUB_REACH="reachable"
 else
-    HUB_REACH="NOT reachable (firewall or hub not listening)"
+    HUB_REACH="not reachable yet (normal until the hub admin opens port 4400 for you)"
 fi
 
 # ---------------------------------------------------------------
@@ -516,13 +526,13 @@ echo "Hub:           $HUB_NAME $HUB_IP:$HUB_PORT - $HUB_REACH"
 echo "Oper login:    /oper admin $OPER_PASS   (also saved in $CRED)"
 echo "Log file:      $INSTALL_PATH/lib/ircd.log"
 echo ""
-echo "NEXT STEP: send the hub admin the file below. The hub cannot accept"
-echo "your server until he adds it and does /rehash:"
-echo "    cat $HUBREQ"
+echo "NEXT STEP (the only one): send this JOIN CODE to the hub admin, privately."
+echo "It contains your link password."
 echo ""
-echo "Then connect right away (instead of waiting for autoconnect):"
-echo "    /oper admin <password above>"
-echo "    /connect $HUB_NAME $HUB_PORT"
+echo "    $JOIN_CODE"
+echo ""
+echo "(also saved in $INSTALL_PATH/JOIN_CODE.txt)"
+echo "Once the hub admin enrolls you, your server links by itself within a few minutes."
 echo ""
 echo "Open firewall (tcp): ${CLIENT_PORTS// /, } and $LINK_PORT"
 echo "Manage:  sudo systemctl {start|stop|restart|status} $SVC_NAME"
